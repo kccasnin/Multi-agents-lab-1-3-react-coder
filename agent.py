@@ -110,133 +110,161 @@ class AgentResult:
 def build_system_prompt(semantic_memory: SemanticMemory, task: str) -> str:
     """
     Construct the system prompt by injecting relevant long-term memories.
-
-    Steps
-    -----
-    1. Call  semantic_memory.retrieve(task, top_k=3)  to get up to three
-       relevant memory strings.
-    2. If any memories were returned, format them as a bulleted list and
-       append them to SYSTEM_PROMPT under a  ## Relevant memories  heading.
-    3. Return the final system prompt string.
-
-    If the memory store is empty (semantic_memory.count() == 0), return
-    SYSTEM_PROMPT unchanged.
+    This function retrieves up to three relevant memories associated with the
+    specified task from the semantic memory. If relevant memories are found,
+    they are formatted as a bulleted list and appended to the standard system
+    prompt. If no memories are available, the original system prompt is returned unchanged.
 
     Parameters
     ----------
     semantic_memory : SemanticMemory
-        The long-term vector store.  May be empty on the first run.
+        The long-term vector store from which relevant memories are retrieved.
     task : str
-        The user's task description.  Used as the retrieval query.
+        The user's task description, which is used as the retrieval query.
 
     Returns
     -------
     str
-        The complete system prompt, with memories appended if available.
+        The complete system prompt, optionally including any relevant memories
+        formatted as a bulleted list.
     """
-    raise NotImplementedError("TODO: implement build_system_prompt()")
+    # Retrieve up to three relevant memories
+    relevant_memories = semantic_memory.retrieve(task, top_k=3)
 
+    # If memories are found, format them as a bullet list
+    if relevant_memories:
+        memories_formatted = "\n## Relevant memories\n" + "\n- ".join(relevant_memories)
+        return SYSTEM_PROMPT + memories_formatted
+
+    # If no memories found, return the default SYSTEM_PROMPT
+    return SYSTEM_PROMPT
 
 def parse_llm_response(response_text: str) -> dict[str, Any]:
     """
-    Parse a single LLM response into a structured dict.
+    Parse a single LLM response into a structured dictionary.
 
-    The response will be in one of two formats (see SYSTEM_PROMPT):
-
-    FORMAT A (tool call):
-        Thought: <text>
-        Action: <tool_name>
-        Action Input: <json>
-
-    FORMAT B (final answer):
-        Thought: <text>
-        FINAL ANSWER: <text>
-
-    Steps
-    -----
-    1. Extract the  Thought:  line.
-    2. Check whether  "FINAL ANSWER:"  appears in the response.
-       • If yes → return {"thought": ..., "final_answer": <everything after "FINAL ANSWER:">}
-    3. Otherwise, extract  Action:  and  Action Input: .
-       • Parse Action Input as JSON with json.loads().
-       • If json.loads() raises, return an error dict so the loop can
-         feed an error observation back to the LLM.
-    4. Return {"thought": ..., "action": ..., "action_input": <dict>}
-
-    Error return format (malformed Action Input):
-        {"thought": ..., "action": ..., "parse_error": <error message string>}
-
-    Hints
-    -----
-    • Use  str.split("Thought:", 1)  /  str.split("Action:", 1)  etc. to
-      extract each field.
-    • Strip whitespace from every extracted value.
-    • The Action Input JSON may contain newlines — extract everything after
-      "Action Input:" up to the end of the string (or next recognised keyword).
+    This function interprets the raw response from the language model, which
+    can either indicate a tool call (FORMAT A) or a final answer (FORMAT B).
+    It extracts the Thought, Action, and Action Input for FORMAT A, or
+    the Thought and FINAL ANSWER for FORMAT B. Any parsing errors encountered
+    during the extraction of Action Input are handled appropriately.
 
     Parameters
     ----------
     response_text : str
-        Raw text from the LLM's message content.
+        The raw text response from the LLM's message content.
 
     Returns
     -------
     dict
-        A structured dict with the keys described above.
+        A structured dictionary containing:
+        - 'thought': The reasoning behind the agent's next step.
+        - Either 'final_answer' for FORMAT B or both 'action' and 'action_input' for FORMAT A.
+        - If there's a parse error, an error message under the 'parse_error' key.
     """
-    raise NotImplementedError("TODO: implement parse_llm_response()")
+    # Extract the Thought line
+    thought = response_text.split("Thought:", 1)[1].strip()
 
+    # Check for FINAL ANSWER
+    if "FINAL ANSWER:" in response_text:
+        final_answer = response_text.split("FINAL ANSWER:", 1)[1].strip()
+        return {"thought": thought, "final_answer": final_answer}
+
+    # Otherwise, extract Action and Action Input
+    action_line = response_text.split("Action:", 1)[1].strip()
+    action = action_line.split("\n", 1)[0].strip()
+    action_input_raw = action_line.split("Action Input:", 1)[1].strip()
+    action_input = action_input_raw.split("\n", 1)[0].strip()  # Handle newlines
+
+    # Try to parse Action Input as JSON
+    try:
+        action_input_dict = json.loads(action_input)
+    except json.JSONDecodeError as e:
+        return {"thought": thought, "action": action, "parse_error": str(e)}
+
+    return {"thought": thought, "action": action, "action_input": action_input_dict}
 
 def run_agent(task: str) -> AgentResult:
     """
-    Run the full ReACT agentic loop for the given *task*.
+    Execute the full ReACT agentic loop for the given task.
 
-    Algorithm
-    ---------
-    1. Initialise a SlidingWindowBuffer and a SemanticMemory.
-    2. Call build_system_prompt() and pass the result to buffer.set_system().
-    3. Add the user task as the first message:  buffer.add("user", task)
-    4. Enter the loop (up to MAX_ITERATIONS):
-        a. Call the LLM with  client.chat.completions.create()  passing
-           buffer.messages() and TOOL_SCHEMAS as the tools list.
-           Use  tool_choice="none"  so the model uses the ReACT text format
-           rather than native function-calling.
-        b. Extract the assistant's text: response.choices[0].message.content
-        c. Add the assistant message to the buffer:
-               buffer.add("assistant", <assistant_text>)
-        d. Parse the response with  parse_llm_response().
-        e. If the parsed result contains "final_answer":
-               • Store the final answer in semantic memory:
-                     semantic_memory.store("Task: " + task + "\\nAnswer: " + final_answer)
-               • Return an AgentResult with stopped_early=False.
-        f. If the parsed result contains "parse_error":
-               • Build an observation string:
-                     "OBSERVATION: Parse error – " + parse_error
-               • Add it to the buffer as a user message and continue.
-        g. Otherwise (normal tool call):
-               • Call  dispatch_tool(action, action_input)  to get the result.
-               • Record the call in the tool_calls list.
-               • Build the observation:
-                     "OBSERVATION: " + tool_result
-               • Store noteworthy observations in semantic memory
-                 (store if the observation does NOT start with "ERROR").
-               • Add the observation to the buffer as a user message.
-    5. If the loop ends without a FINAL ANSWER, return AgentResult with
-       stopped_early=True and answer="MAX_ITERATIONS reached".
+    This function initializes necessary components (SlidingWindowBuffer and
+    SemanticMemory), builds the system prompt, and adds the user's task. It
+    enters a loop where it continuously calls the language model, processes
+    the responses, and manages tool usage until a final answer is achieved
+    or the maximum iteration limit is reached. Parsed results, tool calls,
+    and observations are logged appropriately.
 
     Parameters
     ----------
     task : str
-        Natural language description of the coding task to complete.
+        A natural language description of the coding task that the agent is
+        expected to complete.
 
     Returns
     -------
     AgentResult
-        Structured result including the final answer, iteration count,
-        and a log of all tool calls made.
+        A structured result containing the final answer (if achieved), the
+        total number of iterations, and a log of all tool calls made by
+        the agent.
     """
-    raise NotImplementedError("TODO: implement run_agent()")
+    # Step 1: Initialize a SlidingWindowBuffer and a SemanticMemory.
+    buffer = SlidingWindowBuffer()
+    semantic_memory = SemanticMemory()
+    # Step 2: Call build_system_prompt() and set the system prompt in the buffer.
+    system_prompt = build_system_prompt(semantic_memory, task)
+    buffer.set_system(system_prompt)
+    # Step 3: Add the user task as the first message.
+    buffer.add("user", task)
 
+    tool_calls = []  # to record tool calls
+    # Step 4: Enter the loop (up to MAX_ITERATIONS).
+    for iteration in range(MAX_ITERATIONS):
+        # Step 4a: Call the LLM.
+        response = client.chat.completions.create(
+            messages=buffer.messages(),
+            tools=TOOL_SCHEMAS,
+            tool_choice="none"
+        )
+
+        # Step 4b: Extract the assistant's text.
+        assistant_text = response.choices[0].message.content
+
+        # Step 4c: Add the assistant message to the buffer.
+        buffer.add("assistant", assistant_text)
+
+        # Step 4d: Parse the response.
+        parsed_response = parse_llm_response(assistant_text)
+
+        # Step 4e: Check if it contains a final answer.
+        if "final_answer" in parsed_response:
+            final_answer = parsed_response["final_answer"]
+
+            # Store the answer in semantic memory.
+            semantic_memory.store("Task: " + task + "\nAnswer: " + final_answer)
+            return AgentResult(final_answer, iteration + 1, tool_calls, stopped_early=False)
+
+        # Step 4f: Check for parse errors.
+        elif "parse_error" in parsed_response:
+            parse_error = parsed_response["parse_error"]
+            observation = f"OBSERVATION: Parse error – {parse_error}"
+            buffer.add("user", observation)
+            continue
+
+        # Step 4g: Handle normal tool call.
+        action = parsed_response["action"]
+        action_input = parsed_response["action_input"]
+        tool_result = dispatch_tool(action, action_input)
+        tool_calls.append({"tool": action, "args": action_input, "result": tool_result})
+
+        # Build the observation.
+        observation = f"OBSERVATION: {tool_result}"
+        if not tool_result.startswith("ERROR"):
+            semantic_memory.store(observation)
+        buffer.add("user", observation)
+
+    # Step 5: If the loop ends without a FINAL ANSWER, return the result indicating early termination.
+    return AgentResult(answer="MAX_ITERATIONS reached", iterations=MAX_ITERATIONS, tool_calls=tool_calls, stopped_early=True)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -253,3 +281,4 @@ DEMO_TASK = (
 if __name__ == "__main__":
     result = run_agent(DEMO_TASK)
     print(result)
+
